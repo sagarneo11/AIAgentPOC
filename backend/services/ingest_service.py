@@ -1,0 +1,373 @@
+import pdfplumber
+import httpx
+from bs4 import BeautifulSoup
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.embeddings import OllamaEmbeddings
+from langchain_community.vectorstores import FAISS
+from langchain.schema import Document
+import os
+import tempfile
+import asyncio
+from typing import Dict
+from .document_tracker import DocumentTracker
+
+class IngestService:
+    def __init__(self, document_tracker=None):
+        self.embeddings = OllamaEmbeddings(
+            model="richardyoung/smolvlm2-2.2b-instruct",
+            base_url="http://localhost:11434"
+        )
+        self.vector_store = None
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200
+        )
+        # Get the backend directory path
+        backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        self.store_path = os.path.join(backend_dir, "vector_store")
+        self.document_tracker = document_tracker or DocumentTracker()
+        self._load_or_create_vector_store()
+
+    def _load_or_create_vector_store(self):
+        """Load existing vector store or create a new one."""
+        store_path = self.store_path
+        if os.path.exists(store_path) and os.listdir(store_path):
+            try:
+                self.vector_store = FAISS.load_local(
+                    store_path,
+                    self.embeddings,
+                    allow_dangerous_deserialization=True
+                )
+                print(f"Loaded existing vector store from {store_path}")
+            except Exception as e:
+                print(f"Error loading vector store: {e}. Will create new one on first ingest.")
+                self.vector_store = None
+        else:
+            print(f"Vector store not found at {store_path}. Will create on first ingest.")
+            self.vector_store = None
+
+    def _save_vector_store(self):
+        """Save the vector store to disk."""
+        store_path = self.store_path
+        if self.vector_store:
+            try:
+                # Create directory if it doesn't exist
+                os.makedirs(store_path, exist_ok=True)
+                self.vector_store.save_local(store_path)
+                print(f"Saved vector store to {store_path}")
+            except Exception as e:
+                print(f"Error saving vector store: {e}")
+                raise
+
+    async def extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
+        """Extract text from PDF bytes."""
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+                tmp_file.write(pdf_bytes)
+                tmp_file_path = tmp_file.name
+
+            text = ""
+            with pdfplumber.open(tmp_file_path) as pdf:
+                for page in pdf.pages:
+                    page_text = page.extract_text()
+                    if page_text:
+                        text += page_text + "\n"
+
+            os.unlink(tmp_file_path)
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"Failed to extract text from PDF: {str(e)}")
+
+    async def extract_text_from_url(self, url: str) -> str:
+        """Extract text from a URL."""
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                html = response.text
+
+            soup = BeautifulSoup(html, "html.parser")
+            
+            # Remove script and style elements
+            for script in soup(["script", "style"]):
+                script.decompose()
+
+            # Extract text
+            text = soup.get_text()
+
+            # Clean up whitespace
+            lines = (line.strip() for line in text.splitlines())
+            chunks = (phrase.strip() for line in lines for phrase in line.split("  "))
+            text = "\n".join(chunk for chunk in chunks if chunk)
+
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"Failed to extract text from URL: {str(e)}")
+
+    async def ingest_pdf(self, pdf_bytes: bytes, filename: str) -> Dict:
+        """Ingest a PDF file into the vector store."""
+        text = await self.extract_text_from_pdf(pdf_bytes)
+        
+        if not text or len(text.strip()) == 0:
+            raise Exception("No text content extracted from PDF")
+
+        # Create document entry first to get the ID
+        doc = self.document_tracker.add_document(
+            doc_type="pdf",
+            source=filename,
+            chunks_count=0,  # Will be updated after ingestion
+            filename=filename
+        )
+        doc_id = doc["id"]
+
+        # Ingest with document ID
+        result = await self._ingest_text(text, doc_id=doc_id)
+        
+        # Update document with actual chunks count
+        doc["chunks_count"] = result["chunks_count"]
+        self.document_tracker._save_documents()
+        
+        return result
+
+    async def ingest_url(self, url: str) -> Dict:
+        """Ingest a URL into the vector store."""
+        text = await self.extract_text_from_url(url)
+        
+        if not text or len(text.strip()) == 0:
+            raise Exception("No text content extracted from URL")
+
+        # Create document entry first to get the ID
+        doc = self.document_tracker.add_document(
+            doc_type="url",
+            source=url,
+            chunks_count=0  # Will be updated after ingestion
+        )
+        doc_id = doc["id"]
+
+        # Ingest with document ID
+        result = await self._ingest_text(text, doc_id=doc_id)
+        
+        # Update document with actual chunks count
+        doc["chunks_count"] = result["chunks_count"]
+        self.document_tracker._save_documents()
+        
+        return result
+
+    async def _ingest_text(self, text: str, doc_id: int = None) -> Dict:
+        """Ingest text into the vector store."""
+        try:
+            print(f"Ingesting text, length: {len(text)} characters")
+            
+            # Split text into chunks (this is synchronous)
+            chunks = self.text_splitter.create_documents([text])
+            print(f"Created {len(chunks)} chunks")
+
+            if len(chunks) == 0:
+                raise Exception("No chunks created from text")
+
+            # Convert to list of texts for FAISS
+            texts = [chunk.page_content for chunk in chunks]
+            # Add document ID to metadata if provided
+            metadatas = []
+            for chunk in chunks:
+                meta = chunk.metadata.copy()
+                if doc_id:
+                    meta["doc_id"] = doc_id
+                metadatas.append(meta)
+
+            # Run FAISS operations in executor since they're blocking
+            loop = asyncio.get_event_loop()
+            
+            # Add documents to vector store
+            if self.vector_store is None:
+                print("Creating new vector store...")
+                # Test embeddings first
+                try:
+                    test_embedding = await self.embeddings.aembed_query("test")
+                    print(f"Embeddings working, dimension: {len(test_embedding)}")
+                except Exception as e:
+                    error_msg = str(e)
+                    if "richardyoung/smolvlm2-2.2b-instruct" in error_msg.lower() or "not found" in error_msg.lower():
+                        raise Exception(
+                            "Embedding model 'richardyoung/smolvlm2-2.2b-instruct' is not installed.\n"
+                            "Please run: ollama pull richardyoung/smolvlm2-2.2b-instruct\n"
+                            "Then restart the backend server."
+                        )
+                    else:
+                        raise Exception(f"Embeddings not working. Make sure Ollama is running: {error_msg}")
+                
+                # Create new vector store in executor
+                def create_store():
+                    return FAISS.from_texts(
+                        texts,
+                        self.embeddings,
+                        metadatas=metadatas
+                    )
+                
+                self.vector_store = await loop.run_in_executor(None, create_store)
+                print("Vector store created successfully")
+            else:
+                print("Adding to existing vector store...")
+                # Add to existing vector store in executor
+                def add_texts():
+                    self.vector_store.add_texts(texts, metadatas)
+                    return None
+                
+                await loop.run_in_executor(None, add_texts)
+                print("Texts added to vector store")
+
+            # Save the updated vector store in executor
+            def save_store():
+                self._save_vector_store()
+                return None
+            
+            await loop.run_in_executor(None, save_store)
+            print("Vector store saved")
+
+            return {
+                "chunks_count": len(chunks)
+            }
+        except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"Error in _ingest_text: {error_trace}")
+            raise
+    
+    async def delete_document(self, doc_id: int) -> Dict:
+        """Delete a document and its chunks from the vector store."""
+        if self.vector_store is None:
+            raise Exception("No vector store loaded")
+        
+        # Get all documents from the tracker
+        doc = self.document_tracker.get_document(doc_id)
+        if not doc:
+            raise Exception(f"Document with ID {doc_id} not found")
+        
+        # FAISS doesn't support direct deletion, so we need to rebuild the store
+        # Get all chunks that DON'T match this doc_id
+        print(f"Deleting document {doc_id} from vector store...")
+        
+        loop = asyncio.get_event_loop()
+        
+        def rebuild_store():
+            # Get all documents from docstore
+            docstore = self.vector_store.docstore
+            index = self.vector_store.index
+            num_vectors = index.ntotal
+            
+            # Collect all chunks that should be kept
+            texts_to_keep = []
+            metadatas_to_keep = []
+            
+            # Use similarity search to get all chunks, then filter
+            # This is not perfect but FAISS doesn't support deletion
+            search_terms = ["", "the", "a", "document", "text"]
+            all_docs_seen = set()
+            
+            for term in search_terms:
+                try:
+                    docs = self.vector_store.similarity_search(term, k=min(500, num_vectors))
+                    for doc_item in docs:
+                        # Use content hash to avoid duplicates
+                        content_hash = hash(doc_item.page_content)
+                        if content_hash in all_docs_seen:
+                            continue
+                        all_docs_seen.add(content_hash)
+                        
+                        # Check if this chunk belongs to the document we're deleting
+                        metadata = doc_item.metadata if isinstance(doc_item.metadata, dict) else {}
+                        chunk_doc_id = metadata.get("doc_id")
+                        
+                        # Normalize doc_id
+                        if isinstance(chunk_doc_id, int):
+                            chunk_doc_id_int = chunk_doc_id
+                        elif isinstance(chunk_doc_id, (list, tuple)) and len(chunk_doc_id) > 0:
+                            try:
+                                chunk_doc_id_int = int(chunk_doc_id[0])
+                            except:
+                                continue
+                        elif isinstance(chunk_doc_id, (str, float)):
+                            try:
+                                chunk_doc_id_int = int(chunk_doc_id)
+                            except:
+                                continue
+                        else:
+                            continue
+                        
+                        # Keep chunks that don't match the doc_id we're deleting
+                        if chunk_doc_id_int != doc_id:
+                            texts_to_keep.append(doc_item.page_content)
+                            metadatas_to_keep.append(metadata)
+                except Exception as e:
+                    print(f"Error in similarity search during deletion: {e}")
+                    continue
+            
+            print(f"Keeping {len(texts_to_keep)} chunks after deletion (removed chunks for doc_id {doc_id})")
+            
+            # Rebuild the vector store with remaining chunks
+            if len(texts_to_keep) > 0:
+                new_store = FAISS.from_texts(
+                    texts_to_keep,
+                    self.embeddings,
+                    metadatas=metadatas_to_keep
+                )
+                return new_store
+            else:
+                # No chunks left, return None to indicate empty store
+                return None
+        
+        new_store = await loop.run_in_executor(None, rebuild_store)
+        
+        remaining_chunks = 0
+        if new_store is None:
+            # Empty store - delete the files
+            import shutil
+            if os.path.exists(self.store_path):
+                shutil.rmtree(self.store_path)
+            self.vector_store = None
+            print("Vector store is now empty, removed from disk")
+            remaining_chunks = 0
+        else:
+            self.vector_store = new_store
+            # Get count from the new store
+            try:
+                remaining_chunks = new_store.index.ntotal
+            except:
+                remaining_chunks = 0
+            # Save the updated store
+            def save_store():
+                self._save_vector_store()
+                return None
+            await loop.run_in_executor(None, save_store)
+            print("Vector store rebuilt without deleted document")
+        
+        # Remove from document tracker
+        self.document_tracker.delete_document(doc_id)
+        
+        return {
+            "success": True,
+            "message": f"Document {doc_id} deleted successfully",
+            "remaining_chunks": remaining_chunks
+        }
+    
+    async def clear_all_data(self) -> Dict:
+        """Clear all data: vector store, document tracker, and files."""
+        import shutil
+        
+        # Clear vector store
+        if self.vector_store is not None:
+            self.vector_store = None
+            print("Vector store cleared from memory")
+        
+        # Delete vector store directory
+        if os.path.exists(self.store_path):
+            shutil.rmtree(self.store_path)
+            print(f"Deleted vector store directory: {self.store_path}")
+        
+        # Clear document tracker
+        self.document_tracker.clear_all_documents()
+        
+        return {
+            "success": True,
+            "message": "All data cleared successfully"
+        }
